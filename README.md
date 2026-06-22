@@ -184,5 +184,5 @@ async def request_timing_middleware(request, call_next):
     if _sentry is None:
         return await call_next(request)
     label = f"HTTP {request.method} {request.url.path}"
-    return await _sentry.watch(call_next(request), name=label)
+    return await _sentry.track_request(call_next(request), name=label)
 ```

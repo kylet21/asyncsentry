@@ -1,4 +1,6 @@
 """
+asyncsentry.monitor
+~~~~~~~~~~~~~~~~~~~
 Core blocking-detection monitor. Runs a background thread that polls the event
 loop at a fixed interval; if the loop has not responded within `threshold`
 seconds it is considered blocked.
@@ -6,6 +8,8 @@ seconds it is considered blocked.
 All events are emitted as structured JSON lines to the Python `logging`
 infrastructure so they are captured by any log aggregator (stdout in a
 container, Loki, CloudWatch, etc.).
+
+No files are written.
 """
 
 from __future__ import annotations
@@ -19,9 +23,8 @@ import logging
 import os
 import threading
 import time
-import traceback
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Dict, List, Optional, TypeVar
 
 import psutil
@@ -41,7 +44,7 @@ class BlockEvent:
     duration: float
     thread_id: int
     task_name: Optional[str]
-    culprit: Optional[str]            # "file:line in function" of top app frame
+    culprit: Optional[str]
     stack_frames: List[Dict[str, Any]]
     cpu_percent: float
     memory_mb: float
@@ -95,8 +98,31 @@ def _extract_frames(frame, max_frames: int = 20) -> List[Dict[str, Any]]:
     return frames
 
 
+def _extract_task_frames(task: asyncio.Task, max_frames: int = 20) -> List[Dict[str, Any]]:
+    """Extract stack frames directly from a live asyncio Task's coroutine stack."""
+    try:
+        # get_stack() returns frames from outermost to innermost; we reverse to
+        # match the innermost-first convention used elsewhere in this module.
+        raw_frames = task.get_stack(limit=max_frames)
+        result = []
+        for f in reversed(raw_frames):
+            co = f.f_code
+            filename = co.co_filename
+            lineno = f.f_lineno
+            source_line = linecache.getline(filename, lineno).strip()
+            result.append({
+                "filename": filename,
+                "lineno": lineno,
+                "function": co.co_name,
+                "source": source_line,
+                "is_app_frame": _is_app_frame(f),
+            })
+        return result
+    except Exception:
+        return []
+
+
 def _find_culprit(frames: List[Dict[str, Any]]) -> Optional[str]:
-    """Return the innermost application-level frame as a readable culprit string."""
     for f in frames:
         if f.get("is_app_frame"):
             return f"{f['filename']}:{f['lineno']} in {f['function']}"
@@ -137,7 +163,6 @@ _LOG_LEVEL_MAP = {
 
 
 def _emit(event: BlockEvent) -> None:
-    """Serialize an event to a structured JSON log line."""
     payload = {
         "asyncsentry": True,
         "event_type": event.event_type,
@@ -152,7 +177,6 @@ def _emit(event: BlockEvent) -> None:
     }
     if event.extra:
         payload.update(event.extra)
-
     level = _LOG_LEVEL_MAP.get(event.event_type, logging.WARNING)
     logger.log(level, json.dumps(payload, default=str))
 
@@ -169,27 +193,22 @@ def _emit_lifecycle(event_type: str, extra: Optional[Dict] = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Async task tracker
+# Task registry
 # ---------------------------------------------------------------------------
 
-class _TaskTracker:
+class _TaskRegistry:
     """
-    Wraps asyncio's task factory to track when tasks start and finish.
-    Detects slow coroutines by comparing actual wall-time against
-    `async_threshold`.
+    Tracks live asyncio Tasks by hooking the task factory.
 
-    Also exposes `watch(coro, name)` so that directly-awaited coroutines
-    (not wrapped in create_task) can be timed without spawning a Task.
+    The watchdog thread reads _start_times to find tasks that have been
+    running longer than async_threshold and samples their stacks while they
+    are still alive.  The done-callback only handles cleanup.
     """
 
-    def __init__(self, threshold: float) -> None:
-        self._threshold = threshold
-        self._start_times: Dict[int, float] = {}
+    def __init__(self) -> None:
+        # task_id -> (start_monotonic, task_ref)
+        self._tasks: Dict[int, tuple[float, asyncio.Task]] = {}
         self._lock = threading.Lock()
-
-    # ------------------------------------------------------------------
-    # Task-factory hook (covers asyncio.create_task / ensure_future)
-    # ------------------------------------------------------------------
 
     def install(self, loop: asyncio.AbstractEventLoop) -> None:
         original_factory = loop.get_task_factory()
@@ -199,74 +218,31 @@ class _TaskTracker:
                 task = asyncio.Task(coro, loop=loop, **kwargs)
             else:
                 task = original_factory(loop, coro, **kwargs)
-            self._attach(task)
+            self._register(task)
             return task
 
         loop.set_task_factory(factory)
 
     def uninstall(self, loop: asyncio.AbstractEventLoop) -> None:
         loop.set_task_factory(None)
+        with self._lock:
+            self._tasks.clear()
 
-    def _attach(self, task: asyncio.Task) -> None:
+    def _register(self, task: asyncio.Task) -> None:
         task_id = id(task)
         with self._lock:
-            self._start_times[task_id] = time.monotonic()
+            self._tasks[task_id] = (time.monotonic(), task)
 
-        def _done_cb(t: asyncio.Task) -> None:
-            now = time.monotonic()
+        def _done(t: asyncio.Task) -> None:
             with self._lock:
-                start = self._start_times.pop(id(t), None)
-            if start is None:
-                return
-            elapsed = now - start
-            if elapsed >= self._threshold:
-                _emit(BlockEvent(
-                    event_type="slow_async",
-                    timestamp=time.time(),
-                    duration=elapsed,
-                    thread_id=threading.get_ident(),
-                    task_name=t.get_name() if hasattr(t, "get_name") else str(t),
-                    culprit=None,
-                    stack_frames=[],
-                    cpu_percent=_cpu_percent(),
-                    memory_mb=_memory_mb(),
-                    gc_collections=_gc_stats(),
-                    extra={"cancelled": t.cancelled()},
-                ))
+                self._tasks.pop(id(t), None)
 
-        task.add_done_callback(_done_cb)
+        task.add_done_callback(_done)
 
-    # ------------------------------------------------------------------
-    # Direct-await wrapper (covers bare `await coro()` calls)
-    # ------------------------------------------------------------------
-
-    async def watch(self, coro: Coroutine, name: Optional[str] = None) -> Any:
-        """
-        Await `coro` while timing it.  Emits a slow_async event if it
-        exceeds the threshold.  Use as a drop-in for direct awaits:
-
-            await sentry.watch(my_coro(), name="my_coro")
-        """
-        label = name or getattr(coro, "__qualname__", repr(coro))
-        start = time.monotonic()
-        try:
-            return await coro
-        finally:
-            elapsed = time.monotonic() - start
-            if elapsed >= self._threshold:
-                _emit(BlockEvent(
-                    event_type="slow_async",
-                    timestamp=time.time(),
-                    duration=elapsed,
-                    thread_id=threading.get_ident(),
-                    task_name=label,
-                    culprit=None,
-                    stack_frames=[],
-                    cpu_percent=_cpu_percent(),
-                    memory_mb=_memory_mb(),
-                    gc_collections=_gc_stats(),
-                    extra={"cancelled": False},
-                ))
+    def snapshot(self) -> List[tuple[float, asyncio.Task]]:
+        """Return a snapshot of (start_time, task) for all live tasks."""
+        with self._lock:
+            return list(self._tasks.values())
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +264,7 @@ class AsyncSentry:
     detect_async_bottlenecks : bool
         Whether to track slow async tasks via the task factory (default True).
     capture_args : bool
-        Whether to include local variable snapshots in stack frames (default False).
+        Whether to include local variable snapshots in block stack frames (default False).
     log_gc : bool
         Whether to log GC collection events (default False).
     max_stack_frames : int
@@ -316,28 +292,30 @@ class AsyncSentry:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop_event = threading.Event()
         self._watchdog_thread: Optional[threading.Thread] = None
-        self._task_tracker: Optional[_TaskTracker] = None
+        self._registry: Optional[_TaskRegistry] = None
         self._gc_callbacks_registered = False
 
-        # Shared heartbeat between loop and watchdog thread
         self._last_tick = time.monotonic()
         self._tick_lock = threading.Lock()
+
+        # Tracks which tasks have already had a slow_async event emitted so we
+        # don't spam the same task on every watchdog poll.
+        self._alerted_tasks: set[int] = set()
+        self._alerted_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def start(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
-        """Start the sentry. Call from within a running async context."""
         self._loop = loop or asyncio.get_event_loop()
         self._stop_event.clear()
 
-        # Schedule a recurring heartbeat coroutine on the event loop
         self._loop.call_soon(self._schedule_heartbeat)
 
         if self.detect_async_bottlenecks:
-            self._task_tracker = _TaskTracker(self.async_threshold)
-            self._task_tracker.install(self._loop)
+            self._registry = _TaskRegistry()
+            self._registry.install(self._loop)
 
         if self.log_gc:
             self._register_gc_callbacks()
@@ -358,15 +336,14 @@ class AsyncSentry:
         })
 
     def stop(self) -> None:
-        """Stop the sentry and clean up."""
         self._stop_event.set()
         if self._watchdog_thread:
             self._watchdog_thread.join(timeout=2.0)
             self._watchdog_thread = None
 
-        if self._task_tracker and self._loop:
-            self._task_tracker.uninstall(self._loop)
-            self._task_tracker = None
+        if self._registry and self._loop:
+            self._registry.uninstall(self._loop)
+            self._registry = None
 
         if self._gc_callbacks_registered:
             self._unregister_gc_callbacks()
@@ -374,33 +351,68 @@ class AsyncSentry:
         _emit_lifecycle("stop")
 
     # ------------------------------------------------------------------
-    # Slow-async convenience wrapper
+    # sentry.watch() — time a directly-awaited coroutine
     # ------------------------------------------------------------------
 
     async def watch(self, coro: Coroutine, name: Optional[str] = None) -> Any:
         """
-        Time a directly-awaited coroutine and emit a slow_async event if it
-        exceeds `async_threshold`.
-
-        Use when you await a coroutine directly (not via create_task) and want
-        it covered by slow-async detection::
+        Time a directly-awaited coroutine and emit a slow_async event with a
+        live stack if it exceeds `async_threshold`.
 
             result = await sentry.watch(my_coro(), name="my_coro")
         """
-        if self._task_tracker is None:
+        label = name or getattr(coro, "__qualname__", repr(coro))
+        start = time.monotonic()
+        try:
             return await coro
-        return await self._task_tracker.watch(coro, name=name)
+        finally:
+            elapsed = time.monotonic() - start
+            if elapsed >= self.async_threshold:
+                # Stack is gone by this point (coroutine finished), so we
+                # emit without frames — the label/name is the identifier.
+                _emit(BlockEvent(
+                    event_type="slow_async",
+                    timestamp=time.time(),
+                    duration=elapsed,
+                    thread_id=threading.get_ident(),
+                    task_name=label,
+                    culprit=None,
+                    stack_frames=[],
+                    cpu_percent=_cpu_percent(),
+                    memory_mb=_memory_mb(),
+                    gc_collections=_gc_stats(),
+                    extra={"cancelled": False, "note": "use create_task for live stack capture"},
+                ))
+
+    # ------------------------------------------------------------------
+    # track_request() — for middleware; wraps handler in a real Task
+    # ------------------------------------------------------------------
+
+    async def track_request(self, coro: Coroutine, name: str) -> Any:
+        """
+        Run `coro` as a named asyncio Task so the watchdog can sample its
+        stack mid-flight via task.get_stack().  Use this in HTTP middleware
+        instead of watch() so slow requests produce stack frames.
+
+            response = await sentry.track_request(call_next(request), name=label)
+        """
+        task = asyncio.ensure_future(coro)
+        task.set_name(name)
+        return await task
+
+    # ------------------------------------------------------------------
+    # @sentry.monitor — decorator for zero call-site changes
+    # ------------------------------------------------------------------
 
     def monitor(self, fn: Callable[..., Coroutine]) -> Callable:
         """
-        Decorator that automatically wraps every call of an async function
-        with `watch`, so you never have to change call sites::
+        Decorator that wraps every call of an async function with watch().
 
             @sentry.monitor
-            async def slow_async_task():
-                await asyncio.sleep(2.5)
+            async def slow_task():
+                ...
 
-            await slow_async_task()   # automatically timed
+            await slow_task()   # automatically timed
         """
         @functools.wraps(fn)
         async def wrapper(*args, **kwargs):
@@ -408,7 +420,7 @@ class AsyncSentry:
         return wrapper
 
     # ------------------------------------------------------------------
-    # Context-manager interface (sync)
+    # Context managers
     # ------------------------------------------------------------------
 
     def __enter__(self) -> "AsyncSentry":
@@ -418,10 +430,6 @@ class AsyncSentry:
     def __exit__(self, *args) -> None:
         self.stop()
 
-    # ------------------------------------------------------------------
-    # Async context-manager interface
-    # ------------------------------------------------------------------
-
     async def __aenter__(self) -> "AsyncSentry":
         self.start()
         return self
@@ -430,18 +438,17 @@ class AsyncSentry:
         self.stop()
 
     # ------------------------------------------------------------------
-    # Heartbeat (runs on the event loop thread)
+    # Heartbeat
     # ------------------------------------------------------------------
 
     def _schedule_heartbeat(self) -> None:
-        """Update the tick timestamp from within the event loop."""
         with self._tick_lock:
             self._last_tick = time.monotonic()
         if not self._stop_event.is_set() and self._loop and self._loop.is_running():
             self._loop.call_later(self.poll_interval / 2, self._schedule_heartbeat)
 
     # ------------------------------------------------------------------
-    # Watchdog loop (runs in a background thread)
+    # Watchdog loop
     # ------------------------------------------------------------------
 
     def _watchdog_loop(self) -> None:
@@ -450,25 +457,77 @@ class AsyncSentry:
             if self._stop_event.is_set():
                 break
 
+            now = time.monotonic()
+
+            # 1. Check for event-loop blocks
             with self._tick_lock:
                 last = self._last_tick
-            elapsed = time.monotonic() - last
-
+            elapsed = now - last
             if elapsed >= self.threshold:
                 self._report_block(elapsed)
 
+            # 2. Check for slow async tasks (mid-flight, stack still live)
+            if self._registry is not None:
+                self._check_slow_tasks(now)
+
+    def _check_slow_tasks(self, now: float) -> None:
+        """
+        Inspect all live tasks. For any that have been running longer than
+        async_threshold and haven't been reported yet, capture their stack
+        via task.get_stack() (which works on live coroutines) and emit.
+        """
+        for start_time, task in self._registry.snapshot():
+            task_id = id(task)
+            elapsed = now - start_time
+
+            if elapsed < self.async_threshold:
+                continue
+
+            # Only emit once per task, not on every poll tick
+            with self._alerted_lock:
+                if task_id in self._alerted_tasks:
+                    continue
+                self._alerted_tasks.add(task_id)
+
+            # Clean up the alert record when the task finishes
+            def _clear_alert(t: asyncio.Task, tid: int = task_id) -> None:
+                with self._alerted_lock:
+                    self._alerted_tasks.discard(tid)
+
+            try:
+                task.add_done_callback(_clear_alert)
+            except Exception:
+                pass
+
+            task_name = task.get_name() if hasattr(task, "get_name") else str(task)
+
+            # get_stack() returns live frames while the coroutine is suspended
+            frames = _extract_task_frames(task, self.max_stack_frames)
+            culprit = _find_culprit(frames)
+
+            _emit(BlockEvent(
+                event_type="slow_async",
+                timestamp=time.time(),
+                duration=elapsed,
+                thread_id=threading.get_ident(),
+                task_name=task_name,
+                culprit=culprit,
+                stack_frames=frames,
+                cpu_percent=_cpu_percent(),
+                memory_mb=_memory_mb(),
+                gc_collections=_gc_stats(),
+                extra={"cancelled": task.cancelled() if task.done() else False},
+            ))
+
     def _report_block(self, elapsed: float) -> None:
-        """Capture stack frames from all threads and emit a block event."""
         import sys
 
         all_frames = sys._current_frames()
         loop_thread_id = None
 
-        # Identify the loop thread via CPython internal
         if self._loop and hasattr(self._loop, "_thread_id"):
             loop_thread_id = self._loop._thread_id
 
-        # Fall back: find a thread running asyncio code
         if loop_thread_id is None:
             for tid, frame in all_frames.items():
                 module = frame.f_globals.get("__name__", "")
@@ -510,7 +569,7 @@ class AsyncSentry:
         except RuntimeError:
             pass
 
-        event = BlockEvent(
+        _emit(BlockEvent(
             event_type="block",
             timestamp=time.time(),
             duration=elapsed,
@@ -521,8 +580,7 @@ class AsyncSentry:
             cpu_percent=_cpu_percent(),
             memory_mb=_memory_mb(),
             gc_collections=_gc_stats(),
-        )
-        _emit(event)
+        ))
 
     @staticmethod
     def _iter_frames(frame):
@@ -532,7 +590,7 @@ class AsyncSentry:
             current = current.f_back
 
     # ------------------------------------------------------------------
-    # GC callback support
+    # GC callbacks
     # ------------------------------------------------------------------
 
     def _gc_callback(self, phase: str, info: Dict[str, Any]) -> None:
@@ -573,8 +631,6 @@ async def asyncsentry_lifespan(**kwargs):
     Async context manager for use inside FastAPI lifespan functions.
 
     Usage::
-
-        from asyncsentry import asyncsentry_lifespan
 
         @asynccontextmanager
         async def lifespan(app):

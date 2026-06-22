@@ -179,7 +179,7 @@ Then ship logs with your existing stack (Fluentd, Promtail, Fluent Bit, etc.).
 ## FastAPI middleware example
 
 ```python
-python@app.middleware("http")
+@app.middleware("http")
 async def request_timing_middleware(request, call_next):
     if _sentry is None:
         return await call_next(request)
